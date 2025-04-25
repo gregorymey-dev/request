@@ -1,0 +1,326 @@
+diff --git a/index.js b/index.js
+index 41f01db..7eddb96 100644
+--- a/index.js
++++ b/index.js
+@@ -8,7 +8,9 @@ var extend = require('extend')
+ var cookies = require('./lib/cookies')
+ var helpers = require('./lib/helpers')
+ var paramsHaveRequestBody = helpers.paramsHaveRequestBody
+-
++// Import SSRF protection
++var ssrfProtection = require('./lib/ssrf-protection')
++var defaultSSRFMiddleware = ssrfProtection.createSSRFProtection()
+ 
+ var isFunction = helpers.isFunction
+ 
+@@ -89,6 +91,21 @@ function request (uri, options, callback) {
+     return new request.Request(options, callback)
+   }
+ 
++  // Apply SSRF protection middleware
+const checkSSRF = async () => {
+  try {
+    // Apply SSRF protection if not explicitly disabled
+    if (options.disableSSRFProtection !== true) {
+      await defaultSSRFMiddleware(options)
+    }
+    return new request.Request(options, callback)
+  } catch (err) {
+    process.nextTick(function () {
+      if (callback) callback(err)
+    })
+    return new request.Request(options, callback)
+  }
+}
+   // Load cookie jar if needed
+   if (options.jar === true) {
+     options.jar = request.jar()
+@@ -106,7 +123,8 @@ function request (uri, options, callback) {
+   }
+   options._defaultsSet = true
+ 
+-  return new request.Request(options, callback)
++  // Return promise-based SSRF check instead of direct Request creation
++  return checkSSRF()
+ }
+ 
+ function verbFunc (verb) {
+diff --git a/package.json b/package.json
+index 9b9a33c..79f9de4 100644
+--- a/package.json
++++ b/package.json
+@@ -45,7 +45,9 @@
+     "safe-buffer": "^5.1.2",
+     "semver": "^5.6.0",
+     "tough-cookie": "^2.5.0",
+-    "tunnel-agent": "^0.6.0"
++    "tunnel-agent": "^0.6.0",
++    "ipaddr.js": "^2.0.1",
++    "url-parse": "^1.5.10"
+   },
+   "scripts": {
+     "test": "npm run lint && npm run test-ci && npm run test-browser",
+diff --git a/lib/tough-cookie-compatibility.js b/lib/tough-cookie-compatibility.js
+new file mode 100644
+index 0000000..fb5d0cb
+--- /dev/null
++++ b/lib/tough-cookie-compatibility.js
+@@ -0,0 +1,31 @@
++// tough-cookie-compatibility.js
++// This adapter ensures compatibility between tough-cookie 2.x API used in request
++// and the newer tough-cookie 4.x API
++
++'use strict';
++
++const toughCookie = require('tough-cookie');
++
++// Check if we're using the new API
++const isNewAPI = typeof toughCookie.CookieJar.deserializeSync === 'function';
++
++// Create compatibility layer if using tough-cookie 4.x
++if (isNewAPI) {
++  // In 4.x, some methods have been renamed or behavior changed
++  const originalJar = toughCookie.CookieJar;
++  
++  // Override methods that have changed signature or behavior
++  const originalGetCookieString = originalJar.prototype.getCookieString;
++  originalJar.prototype.getCookieString = function(url, options, cb) {
++    // Handle both callback and promise-based API
++    if (typeof options === 'function') {
++      cb = options;
++      options = {};
++    }
++    
++    if (typeof cb === 'function') {
++      return originalGetCookieString.call(this, url, options, cb);
++    } else {
++      return originalGetCookieString.call(this, url, options);
++    }
++  };
++}
++
++module.exports = toughCookie;
+diff --git a/lib/cookies.js b/lib/cookies.js
+index 6694b76..4507cb8 100644
+--- a/lib/cookies.js
++++ b/lib/cookies.js
+@@ -3,7 +3,7 @@
+ var url = require('url')
+ 
+ var SSL_OP_NO_TLSv1_2 = require('constants').SSL_OP_NO_TLSv1_2
+-var tough = require('tough-cookie')
++var tough = require('./tough-cookie-compatibility')
+ 
+ var Cookie = tough.Cookie
+ var CookieJar = tough.CookieJar
+diff --git a/lib/ssrf-protection.js b/lib/ssrf-protection.js
+new file mode 100644
+index 0000000..2c3e8fe
+--- /dev/null
++++ b/lib/ssrf-protection.js
+@@ -0,0 +1,152 @@
++// ssrf-protection.js
++// Utility to prevent SSRF attacks in the request library
++
++'use strict';
++
++const url = require('url');
++const net = require('net');
++const ipaddr = require('ipaddr.js');
++
++/**
++ * Default blocklist of private IP ranges
++ */
++const DEFAULT_BLOCKED_RANGES = [
++  // IPv4 private ranges
++  '10.0.0.0/8',       // Private network - RFC 1918
++  '172.16.0.0/12',    // Private network - RFC 1918
++  '192.168.0.0/16',   // Private network - RFC 1918
++  '127.0.0.0/8',      // Localhost - RFC 1122
++  '169.254.0.0/16',   // Link local - RFC 3927
++  '192.0.2.0/24',     // TEST-NET - RFC 5737
++  '198.51.100.0/24',  // TEST-NET - RFC 5737
++  '203.0.113.0/24',   // TEST-NET - RFC 5737
++  '224.0.0.0/4',      // Multicast - RFC 5771
++  '240.0.0.0/4',      // Reserved - RFC 1112
++  '0.0.0.0/8',        // Current network
++
++  // IPv6 private ranges
++  '::/128',           // Unspecified address
++  '::1/128',          // Localhost
++  'fc00::/7',         // Unique local address
++  'fe80::/10',        // Link local address
++  'ff00::/8',         // Multicast
++];
++
++/**
++ * Default allowed protocols
++ */
++const DEFAULT_ALLOWED_PROTOCOLS = ['http:', 'https:'];
++
++/**
++ * Default configuration
++ */
++const DEFAULT_CONFIG = {
++  allowPrivateIPs: false,
++  blockedRanges: DEFAULT_BLOCKED_RANGES,
++  allowedProtocols: DEFAULT_ALLOWED_PROTOCOLS,
++  allowLocalhostDomains: false,
++  blockedHosts: [
++    'localhost',
++    '0.0.0.0',
++    '127.0.0.1',
++    '::1'
++  ]
++};
++
++/**
++ * Parse CIDR notation to check if IP is in range
++ */
++function isIPInRange(ip, cidr) {
++  try {
++    const addr = ipaddr.parse(ip);
++    const range = ipaddr.parseCIDR(cidr);
++    return addr.match(range);
++  } catch (e) {
++    return false;
++  }
++}
++
++/**
++ * Check if a hostname resolves to a private IP address
++ */
++async function isPrivateHost(hostname) {
++  return new Promise((resolve) => {
++    try {
++      const dns = require('dns');
++      dns.lookup(hostname, (err, address) => {
++        if (err || !address) {
++          return resolve(false);
++        }
++        
++        // Check if the resolved IP is in any blocked range
++        const isBlocked = DEFAULT_BLOCKED_RANGES.some(range => 
++          isIPInRange(address, range)
++        );
++        
++        resolve(isBlocked);
++      });
++    } catch (e) {
++      resolve(false);
++    }
++  });
++}
++
++/**
++ * Validate if a URL is safe from SSRF attacks
++ */
++async function validateUrl(inputUrl, config = {}) {
++  // Merge with default config
++  const options = { ...DEFAULT_CONFIG, ...config };
++  
++  // Basic validation
++  if (!inputUrl || typeof inputUrl !== 'string') {
++    throw new Error('Invalid URL');
++  }
++
++  // Parse URL
++  let parsedUrl;
++  try {
++    parsedUrl = new URL(inputUrl);
++  } catch (e) {
++    throw new Error('Invalid URL format');
++  }
++
++  // Protocol check
++  if (!options.allowedProtocols.includes(parsedUrl.protocol)) {
++    throw new Error(`Protocol not allowed: ${parsedUrl.protocol}`);
++  }
++
++  // Hostname checks
++  const hostname = parsedUrl.hostname.toLowerCase();
++  
++  // Check against blocklisted hosts
++  if (options.blockedHosts.includes(hostname)) {
++    throw new Error(`Hostname blocked: ${hostname}`);
++  }
++  
++  // Check localhost domains
++  if (!options.allowLocalhostDomains) {
++    if (hostname === 'localhost' || 
++        hostname.endsWith('.localhost') || 
++        hostname.endsWith('.local')) {
++      throw new Error(`Localhost domain not allowed: ${hostname}`);
++    }
++  }
++  
++  // IP validation
++  const isIP = net.isIP(hostname);
++  if (isIP) {
++    // If it's an IP address, check if it's in a blocked range
++    if (!options.allowPrivateIPs) {
++      const isBlocked = options.blockedRanges.some(range => 
++        isIPInRange(hostname, range)
++      );
++      
++      if (isBlocked) {
++        throw new Error(`IP address in blocked range: ${hostname}`);
++      }
++    }
++  } else {
++    // If it's a hostname, check if it resolves to a private IP
++    if (!options.allowPrivateIPs) {
++      const isPrivate = await isPrivateHost(hostname);
++      if (isPrivate) {
++        throw new Error(`Hostname resolves to private IP: ${hostname}`);
++      }
++    }
++  }
++  
++  return true;
++}
++
++/**
++ * Create middleware to use within request
++ */
++function createSSRFProtection(userConfig = {}) {
++  const config = { ...DEFAULT_CONFIG, ...userConfig };
++  
++  return async function ssrfProtectionMiddleware(options) {
++    // Skip validation if explicitly configured to do so
++    if (options.skipSSRFCheck === true) {
++      return options;
++    }
++
++    let urlToCheck = options.url || options.uri;
++    
++    // Handle when url is an object
++    if (typeof urlToCheck === 'object' && urlToCheck !== null) {
++      urlToCheck = url.format(urlToCheck);
++    }
++    
++    await validateUrl(urlToCheck, config);
++    return options;
++  };
++}
++
++module.exports = {
++  validateUrl,
++  createSSRFProtection,
++  DEFAULT_CONFIG
++};
+diff --git a/request.js b/request.js
+index d3e9fea..f33aa17 100644
+--- a/request.js
++++ b/request.js
+@@ -13,7 +13,7 @@ var qs = require('qs')
+ var querystring = require('querystring')
+ var caseless = require('caseless')
+ var forever = require('forever-agent')
+-var tough = require('tough-cookie')
++var tough = require('./lib/tough-cookie-compatibility')
+ var form = require('form-data')
+ 
+ var tunnel = require('tunnel-agent')
+
+ return checkSSRF()

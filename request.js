@@ -37,6 +37,7 @@ var defer = helpers.defer
 var copy = helpers.copy
 var version = helpers.version
 var globalCookieJar = cookies.jar()
+var tough = require('./lib/tough-cookie-compatibility')
 
 var globalPool = {}
 

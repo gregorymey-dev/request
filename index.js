@@ -12,7 +12,13 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+
 'use strict'
+
+// Import SSRF protection
+var ssrfProtection = require('./lib/ssrf-protection')
+var defaultSSRFMiddleware = ssrfProtection.createSSRFProtection()
+
 
 var extend = require('extend')
 var cookies = require('./lib/cookies')
